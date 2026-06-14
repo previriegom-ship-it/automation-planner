@@ -1,0 +1,10 @@
+{
+  "name": "automation-planner",
+  "version": "1.0.0",
+  "description": "CLI para generar planes de automatización con IA",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node --env-file=.env index.js"
+  }
+}
