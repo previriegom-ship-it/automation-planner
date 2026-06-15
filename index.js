@@ -340,6 +340,26 @@ function guardarArchivos(plan, html) {
   return { jsonPath, htmlPath };
 }
 
+function logExecution(respuestas, plan, filenames) {
+  const log = {
+    timestamp: new Date().toISOString(),
+    responses: respuestas,
+    planTitle: plan.metadata?.title || 'Sin título',
+    planPhases: plan.phases?.length || 0,
+    planChecklistItems: plan.executionChecklist?.length || 0,
+    planFile: filenames.jsonPath,
+    htmlFile: filenames.htmlPath
+  };
+
+  const logsDir = path.join(__dirname, 'logs');
+  if (!fs.existsSync(logsDir)) fs.mkdirSync(logsDir, { recursive: true });
+
+  const logPath = path.join(logsDir, 'executions.jsonl');
+  fs.appendFileSync(logPath, JSON.stringify(log) + '\n', 'utf-8');
+
+  console.log(`✅ Ejecución registrada en ${logPath}`);
+}
+
 async function main() {
   const apiKey = validarApiKey();
 
@@ -359,6 +379,7 @@ async function main() {
     const plan = extraerJSON(textoCrudo);
     const html = generarHTML(plan);
     const { jsonPath, htmlPath } = guardarArchivos(plan, html);
+    logExecution(respuestas, plan, { jsonPath, htmlPath });
 
     console.log('=============================================');
     console.log('  Plan generado correctamente');

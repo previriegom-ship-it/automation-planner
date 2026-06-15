@@ -1,3 +1,4 @@
 .env
 plans/
+logs/
 node_modules/
