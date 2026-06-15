@@ -6,5 +6,8 @@
   "type": "module",
   "scripts": {
     "start": "node --env-file=.env index.js"
+  },
+  "devDependencies": {
+    "wrangler": "^4.100.0"
   }
 }

@@ -1,0 +1,17 @@
+{
+  "name": "automation-planner-proxy",
+  "version": "1.0.0",
+  "description": "Backend Express de Automation Planner (genera planes con Claude, sin Cloudflare)",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "cors": "^2.8.6",
+    "express": "^4.19.2"
+  }
+}

@@ -1,9 +1,15 @@
-import readline from 'node:readline';
-import fs from 'node:fs';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import express from 'express';
+import cors from 'cors';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+app.use(cors());            // CORS para cualquier origen
+app.use(express.json());
+
+// ---------------------------------------------------------------------------
+// Configuración de Anthropic
+// ---------------------------------------------------------------------------
 
 const MODEL = 'claude-sonnet-4-6';
 const MAX_TOKENS = 10000;
@@ -124,43 +130,16 @@ ${JSON.stringify(JSON_SCHEMA, null, 2)}
 - En "createdAt" usa un timestamp ISO 8601.
 - Escribe todo el contenido en espanol, sin guiones largos.`;
 
-function validarApiKey() {
-  const apiKey = process.env.ANTHROPIC_API_KEY?.trim();
-  if (!apiKey || !apiKey.startsWith('sk-ant-')) {
-    console.error('\n  No se encontró una API key válida de Anthropic.\n');
-    console.error('  Pasos para configurarla:');
-    console.error('    1. Copia el archivo .env.example a .env');
-    console.error('    2. Abre .env y pon tu clave real:');
-    console.error('         ANTHROPIC_API_KEY=sk-ant-...');
-    console.error('    3. Obtén tu clave en https://console.anthropic.com/account/keys');
-    console.error('    4. Ejecuta de nuevo con: npm start\n');
-    process.exit(1);
-  }
-  return apiKey;
-}
-
-function hacerPregunta(rl, texto) {
-  return new Promise((resolve) => rl.question(texto, (respuesta) => resolve(respuesta.trim())));
-}
-
-async function recolectarRespuestas(rl, preguntas) {
-  const respuestas = {};
-  for (let i = 0; i < preguntas.length; i++) {
-    console.log(`\n── Pregunta ${i + 1}/${preguntas.length} ──`);
-    let respuesta = '';
-    while (true) {
-      respuesta = await hacerPregunta(rl, `${preguntas[i]}\n> `);
-      if (respuesta.length >= 3) break;
-      console.log('  La respuesta es demasiado corta. Da algo más de detalle (mínimo 3 caracteres).');
-    }
-    respuestas[`pregunta${i + 1}`] = { pregunta: preguntas[i], respuesta };
-  }
-  return respuestas;
-}
+// ---------------------------------------------------------------------------
+// Lógica de generación (portada desde el Worker)
+// ---------------------------------------------------------------------------
 
 async function generarPlan(respuestas, apiKey) {
-  const contenidoUsuario = Object.values(respuestas)
-    .map((r, i) => `${i + 1}. ${r.pregunta}\nRespuesta: ${r.respuesta}`)
+  const contenidoUsuario = PREGUNTAS
+    .map((pregunta, i) => {
+      const valor = respuestas[i + 1] ?? respuestas[String(i + 1)] ?? '';
+      return `${i + 1}. ${pregunta}\nRespuesta: ${valor}`;
+    })
     .join('\n\n');
 
   let response;
@@ -177,66 +156,83 @@ async function generarPlan(respuestas, apiKey) {
         max_tokens: MAX_TOKENS,
         system: SYSTEM_PROMPT,
         messages: [{ role: 'user', content: contenidoUsuario }]
-      })
+      }),
+      signal: AbortSignal.timeout(120000)
     });
   } catch (err) {
-    throw new Error(`No se pudo conectar con la API de Anthropic (problema de red): ${err.message}. Revisa tu conexión e inténtalo de nuevo.`);
+    throw new Error('No se pudo conectar con la API de Anthropic. Intenta de nuevo en unos segundos.');
   }
 
   if (!response.ok) {
+    if (response.status === 401) throw new Error('API key inválida');
+    if (response.status === 429) throw new Error('Límite de uso alcanzado, intenta en unos segundos');
     let detalle = '';
     try {
       const errBody = await response.json();
-      detalle = errBody?.error?.message || JSON.stringify(errBody);
+      detalle = errBody?.error?.message || '';
     } catch {
-      detalle = await response.text().catch(() => '');
+      detalle = '';
     }
-    throw new Error(`La API respondió con error HTTP ${response.status}. Motivo: ${detalle || 'desconocido'}. Inténtalo de nuevo en unos segundos.`);
+    throw new Error(`Error de la API (HTTP ${response.status})${detalle ? ': ' + detalle : ''}`);
   }
 
   const data = await response.json();
   const texto = data?.content?.[0]?.text;
   if (!texto || !texto.trim()) {
-    throw new Error('La API devolvió una respuesta vacía. No hay nada que procesar; inténtalo de nuevo.');
+    throw new Error('La API devolvió una respuesta vacía');
   }
   return texto;
 }
 
 function extraerJSON(textoCrudo) {
-  let limpio = textoCrudo.trim();
-  limpio = limpio.replace(/^```(?:json)?\s*\n?/i, '').replace(/\n?```\s*$/i, '').trim();
+  console.log('[Express] texto crudo (primeros 500):', textoCrudo.substring(0, 500));
 
-  // Si hay texto alrededor, recorta al primer { y último }.
+  let limpio = textoCrudo
+    .trim()
+    .replace(/^﻿/, '')
+    .replace(/^```(?:json)?\s*\n?/i, '')
+    .replace(/\n?```\s*$/i, '')
+    .trim();
+
   const inicio = limpio.indexOf('{');
   const fin = limpio.lastIndexOf('}');
+  if (inicio === -1 || fin === -1 || fin <= inicio) {
+    console.error('[Express] no se encontró objeto JSON. Texto limpio:', limpio.substring(0, 300));
+    throw new Error(`La respuesta de Claude no contiene un objeto JSON válido. Inicio del texto: ${textoCrudo.substring(0, 200)}`);
+  }
   if (inicio > 0 || fin < limpio.length - 1) {
-    if (inicio !== -1 && fin !== -1) limpio = limpio.slice(inicio, fin + 1);
+    limpio = limpio.slice(inicio, fin + 1);
   }
 
   let plan;
   try {
     plan = JSON.parse(limpio);
   } catch (err) {
-    throw new Error(`La respuesta de la API no es JSON válido (${err.message}).\nPrimeros caracteres recibidos:\n${textoCrudo.slice(0, 300)}`);
+    console.error('[Express] JSON.parse falló:', err.message);
+    console.error('[Express] texto completo enviado a parse:', limpio);
+    throw new Error(`JSON inválido (${err.message}). Texto crudo (primeros 300): ${textoCrudo.substring(0, 300)}`);
   }
 
   const faltantes = [];
-  if (!plan.metadata) faltantes.push('metadata');
+  if (!plan.metadata || typeof plan.metadata !== 'object') faltantes.push('metadata');
   if (!Array.isArray(plan.phases) || plan.phases.length === 0) faltantes.push('phases (array no vacío)');
   if (!Array.isArray(plan.executionChecklist)) faltantes.push('executionChecklist');
+
   if (faltantes.length > 0) {
-    throw new Error(`El JSON del plan no incluye campos obligatorios: ${faltantes.join(', ')}.`);
+    console.error('[Express] campos faltantes:', faltantes);
+    throw new Error(`Plan generado incompleto (faltan: ${faltantes.join(', ')})`);
   }
 
-  // Campos de razonamiento: advertencia, no bloqueo (detecta si el modelo no siguió el nuevo esquema)
+  // Campos de razonamiento: advertencia, no bloqueo
   const razonamientoFaltante = [];
   if (!plan.analysis || typeof plan.analysis !== 'object') razonamientoFaltante.push('analysis');
   if (!plan.solutionsEvaluated || typeof plan.solutionsEvaluated !== 'object') razonamientoFaltante.push('solutionsEvaluated');
   if (!plan.viability || typeof plan.viability !== 'object') razonamientoFaltante.push('viability');
   if (razonamientoFaltante.length > 0) {
-    console.warn(`  ⚠ El modelo no incluyó campos de razonamiento: ${razonamientoFaltante.join(', ')}. El plan se generará igual, pero sin esas secciones.`);
+    console.warn('[Express] ⚠ faltan campos de razonamiento:', razonamientoFaltante.join(', '));
   }
 
+  console.log('[Express] plan válido — fases:', plan.phases.length, '| checklist items:', plan.executionChecklist.length, '| razonamiento:', razonamientoFaltante.length === 0 ? 'completo' : `faltan ${razonamientoFaltante.join(',')}`);
   return plan;
 }
 
@@ -490,84 +486,52 @@ function generarHTML(plan) {
 </html>`;
 }
 
-function guardarArchivos(plan, html) {
-  const plansDir = path.join(__dirname, 'plans');
+// ---------------------------------------------------------------------------
+// Rutas
+// ---------------------------------------------------------------------------
+
+app.get('/health', (_req, res) => {
+  res.json({ status: 'ok', service: 'automation-planner-express' });
+});
+
+app.post('/generate', async (req, res) => {
   try {
-    if (!fs.existsSync(plansDir)) fs.mkdirSync(plansDir, { recursive: true });
-  } catch (err) {
-    throw new Error(`No se pudo crear la carpeta ${plansDir}: ${err.message}`);
-  }
+    const { respuestas } = req.body ?? {};
 
-  const now = new Date();
-  const pad = (n) => String(n).padStart(2, '0');
-  const ts = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
-  const jsonPath = path.join(plansDir, `plan-${ts}.json`);
-  const htmlPath = path.join(plansDir, `plan-${ts}.html`);
+    if (!respuestas || typeof respuestas !== 'object' || Object.keys(respuestas).length !== 8) {
+      return res.status(400).json({ success: false, error: 'Faltan respuestas o están vacías' });
+    }
 
-  try {
-    fs.writeFileSync(jsonPath, JSON.stringify(plan, null, 2), 'utf-8');
-    fs.writeFileSync(htmlPath, html, 'utf-8');
-  } catch (err) {
-    throw new Error(`No se pudieron escribir los archivos en ${plansDir}: ${err.message}`);
-  }
-  return { jsonPath, htmlPath };
-}
+    for (let i = 1; i <= 8; i++) {
+      const valor = respuestas[i] ?? respuestas[String(i)];
+      if (!valor || String(valor).trim().length < 3) {
+        return res.status(400).json({ success: false, error: `Respuesta ${i} muy corta o vacía` });
+      }
+    }
 
-function logExecution(respuestas, plan, filenames) {
-  const log = {
-    timestamp: new Date().toISOString(),
-    responses: respuestas,
-    planTitle: plan.metadata?.title || 'Sin título',
-    planPhases: plan.phases?.length || 0,
-    planChecklistItems: plan.executionChecklist?.length || 0,
-    planFile: filenames.jsonPath,
-    htmlFile: filenames.htmlPath
-  };
+    const apiKey = process.env.ANTHROPIC_API_KEY;
+    if (!apiKey || !apiKey.startsWith('sk-ant-')) {
+      return res.status(500).json({ success: false, error: 'API key no configurada' });
+    }
 
-  const logsDir = path.join(__dirname, 'logs');
-  if (!fs.existsSync(logsDir)) fs.mkdirSync(logsDir, { recursive: true });
-
-  const logPath = path.join(logsDir, 'executions.jsonl');
-  fs.appendFileSync(logPath, JSON.stringify(log) + '\n', 'utf-8');
-
-  console.log(`✅ Ejecución registrada en ${logPath}`);
-}
-
-async function main() {
-  const apiKey = validarApiKey();
-
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-
-  console.log('\n=============================================');
-  console.log('  AUTOMATION PLANNER');
-  console.log('  Planes de automatización a partir de 8 preguntas');
-  console.log('=============================================');
-
-  try {
-    const respuestas = await recolectarRespuestas(rl, PREGUNTAS);
-    rl.close();
-
-    console.log('\nGenerando tu plan de automatización con IA...\n');
-    const textoCrudo = await generarPlan(respuestas, apiKey);
-    const plan = extraerJSON(textoCrudo);
+    const planText = await generarPlan(respuestas, apiKey);
+    const plan = extraerJSON(planText);
     const html = generarHTML(plan);
-    const { jsonPath, htmlPath } = guardarArchivos(plan, html);
-    logExecution(respuestas, plan, { jsonPath, htmlPath });
 
-    console.log('=============================================');
-    console.log('  Plan generado correctamente');
-    console.log('=============================================');
-    console.log(`  JSON: ${jsonPath}`);
-    console.log(`  HTML: ${htmlPath}`);
-    console.log(`\n  Fases: ${plan.phases.length} · Checklist: ${(plan.executionChecklist || []).length} items`);
-    console.log('  Abre el HTML en tu navegador para ver el plan.');
-    console.log('=============================================\n');
-  } catch (err) {
-    if (!rl.closed) rl.close();
-    console.error('\n  No se pudo completar el plan.');
-    console.error(`  ${err.message}\n`);
-    process.exit(1);
+    return res.json({ success: true, plan, html });
+  } catch (error) {
+    console.error('[Express] Error:', error.message);
+    const status = error.message === 'API key inválida' ? 401
+      : error.message.startsWith('Límite') ? 429
+      : 500;
+    return res.status(status).json({ success: false, error: error.message });
   }
-}
+});
 
-main();
+app.use((_req, res) => {
+  res.status(404).json({ success: false, error: 'Not found' });
+});
+
+app.listen(PORT, () => {
+  console.log(`[Express] Automation Planner escuchando en http://localhost:${PORT}`);
+});
