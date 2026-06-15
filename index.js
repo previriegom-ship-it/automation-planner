@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const MODEL = 'claude-sonnet-4-6';
-const MAX_TOKENS = 4000;
+const MAX_TOKENS = 8000;
 const API_URL = 'https://api.anthropic.com/v1/messages';
 
 const PREGUNTAS = [
